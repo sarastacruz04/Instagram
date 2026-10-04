@@ -4,9 +4,10 @@ import { useCallback, useEffect, useState } from 'react';
 import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { timeAgo } from '@/core/format';
-import { activityRepository, profileRepository } from '@/di/container';
+import { activityRepository, profileRepository, syncQueue } from '@/di/container';
 import type { ActivityItem } from '@/domain/entities/Post';
 import type { Profile } from '@/domain/entities/Profile';
+import { hideRespondedRequests } from '@/domain/sync/reconcile';
 import { Avatar } from '@/presentation/components/Avatar';
 import { MediaImage } from '@/presentation/components/MediaImage';
 import { SmallButton } from '@/presentation/components/SmallButton';
@@ -23,8 +24,14 @@ export default function ActivityScreen() {
   const load = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [r, a] = await Promise.all([profileRepository.getPendingRequests(), activityRepository.getActivity()]);
-      setRequests(r);
+      const [r, a, pending] = await Promise.all([
+        profileRepository.getPendingRequests(),
+        activityRepository.getActivity(),
+        syncQueue.pendingOperations(),
+      ]);
+      // Reconciliar: las solicitudes que ya acepté/rechacé sin red siguen "pending" en el
+      // servidor hasta que la cola las envíe; no deben reaparecer en la lista.
+      setRequests(hideRespondedRequests(r, pending));
       setItems(a);
     } catch {
     } finally {
@@ -44,13 +51,25 @@ export default function ActivityScreen() {
     return profileRepository.subscribeToRequests(myId, () => void load());
   }, [myId, load]);
 
-  // Aprobar/rechazar: se quita de la lista al instante (optimista) y se revierte si falla.
+  // Si el servidor rechaza una respuesta (p. ej. perdí el permiso), recargar la lista real.
+  useEffect(
+    () =>
+      syncQueue.onPermanentFailure((op, reason) => {
+        if (op.type !== 'RESPOND_FOLLOW_REQUEST') return;
+        Alert.alert('No se pudo responder la solicitud', reason);
+        void load();
+      }),
+    [load],
+  );
+
+  // Aprobar/rechazar OPTIMISTA + cola offline: la fila desaparece al instante (con o sin red)
+  // y la decisión se guarda en SQLite; el SyncEngine la envía en orden cuando hay conexión.
   const respond = async (person: Profile, accept: boolean) => {
     setRequests((list) => list.filter((p) => p.id !== person.id));
     try {
-      if (accept) await profileRepository.acceptRequest(person.id);
-      else await profileRepository.rejectRequest(person.id);
+      await syncQueue.enqueue({ type: 'RESPOND_FOLLOW_REQUEST', payload: { followerId: person.id, accept } });
     } catch (e) {
+      // Ni siquiera se pudo guardar en SQLite: revertir.
       setRequests((list) => [person, ...list]);
       Alert.alert('Error', (e as Error).message);
     }

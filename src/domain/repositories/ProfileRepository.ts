@@ -1,17 +1,12 @@
 import type { FollowStatus, Profile, ProfileStats } from '../entities/Profile';
 
-export interface ProfileUpdate {
-  fullName?: string;
-  bio?: string;
-  isPrivate?: boolean;
-}
-
+// Editar el perfil y responder solicitudes NO están aquí: son escrituras que van por la
+// cola offline (operaciones UPDATE_PROFILE y RESPOND_FOLLOW_REQUEST de SyncOperation).
 export interface ProfileRepository {
   getById(id: string): Promise<Profile | null>;
   isUsernameAvailable(username: string): Promise<boolean>;
   search(query: string): Promise<Profile[]>;
   getStats(id: string): Promise<ProfileStats>;
-  update(id: string, changes: ProfileUpdate): Promise<void>;
   uploadAvatar(id: string, localUri: string): Promise<string>;
 
   // --- Seguidores ---
@@ -23,8 +18,6 @@ export interface ProfileRepository {
   getFollowers(userId: string): Promise<Profile[]>;
   getFollowing(userId: string): Promise<Profile[]>;
   getPendingRequests(): Promise<Profile[]>;
-  acceptRequest(followerId: string): Promise<void>;
-  rejectRequest(followerId: string): Promise<void>;
   /** Tiempo real: avisa cuando llega una nueva solicitud de seguimiento. */
   subscribeToRequests(myId: string, onChange: () => void): () => void;
 }

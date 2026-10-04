@@ -1,7 +1,9 @@
+import { Alert } from 'react-native';
 import { create } from 'zustand';
 
-import { authRepository, profileRepository, syncEngine } from '@/di/container';
+import { authRepository, profileRepository, syncEngine, syncQueue } from '@/di/container';
 import type { Profile } from '@/domain/entities/Profile';
+import { applyPendingProfile } from '@/domain/sync/reconcile';
 
 // Estado GLOBAL de sesión. Zustand guarda el estado fuera del árbol de React:
 // cualquier módulo (p. ej. el motor de sincronización) puede leerlo con getState()
@@ -47,10 +49,31 @@ export async function refreshMyProfile(): Promise<void> {
   const { userId } = useSession.getState();
   if (!userId) return;
   try {
-    const profile = await profileRepository.getById(userId);
+    const remote = await profileRepository.getById(userId);
+    // Reconciliar: si hay una edición del perfil todavía en la cola, el servidor aún no la
+    // tiene; se aplica encima para no "deshacer" visualmente lo que el usuario guardó.
+    const profile = remote ? applyPendingProfile(remote, await syncQueue.pendingOperations()) : null;
     // Evita una carrera: si la sesión cambió mientras esperábamos la red, se descarta el resultado.
     if (useSession.getState().userId === userId) useSession.setState({ profile });
   } catch {
     // Sin red: seguimos con el perfil anterior. La UI no depende de él para navegar.
   }
 }
+
+/**
+ * Editar perfil OPTIMISTA: el perfil cambia en memoria al instante (la pantalla de perfil
+ * lo muestra ya, con o sin red) y la intención se guarda en la cola offline.
+ */
+export async function updateMyProfile(changes: { fullName: string; bio: string; isPrivate: boolean }): Promise<void> {
+  const { profile } = useSession.getState();
+  if (!profile) return;
+  useSession.setState({ profile: { ...profile, ...changes } });
+  await syncQueue.enqueue({ type: 'UPDATE_PROFILE', payload: changes });
+}
+
+// Rechazo definitivo del servidor → volver a lo que realmente tiene el servidor.
+syncQueue.onPermanentFailure((op, reason) => {
+  if (op.type !== 'UPDATE_PROFILE') return;
+  Alert.alert('No se pudo guardar tu perfil', reason);
+  void refreshMyProfile();
+});

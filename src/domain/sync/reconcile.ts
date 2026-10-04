@@ -1,4 +1,5 @@
 import type { Post } from '../entities/Post';
+import type { Profile } from '../entities/Profile';
 import type { SyncOperation } from './SyncOperation';
 
 /**
@@ -31,6 +32,23 @@ export function applyPendingIntents(posts: Post[], pending: SyncOperation[]): Po
     if (extra) next = { ...next, commentCount: next.commentCount + extra };
     return next;
   });
+}
+
+/** Mi perfil del servidor + la última edición que sigue en la cola (la intención local gana). */
+export function applyPendingProfile(profile: Profile, pending: SyncOperation[]): Profile {
+  let result = profile;
+  for (const op of pending) {
+    if (op.type === 'UPDATE_PROFILE') result = { ...result, ...op.payload };
+  }
+  return result;
+}
+
+/** Solicitudes ya respondidas localmente (aceptar/rechazar en cola) no deben reaparecer. */
+export function hideRespondedRequests<T extends { id: string }>(requests: T[], pending: SyncOperation[]): T[] {
+  const answered = new Set(
+    pending.filter((op) => op.type === 'RESPOND_FOLLOW_REQUEST').map((op) => op.payload.followerId),
+  );
+  return answered.size ? requests.filter((r) => !answered.has(r.id)) : requests;
 }
 
 /** Posts creados offline que aún no suben: se reconstruyen desde la cola para mostrarlos. */

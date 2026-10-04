@@ -2,7 +2,7 @@ import { File } from 'expo-file-system';
 
 import type { FollowStatus, Profile, ProfileStats } from '@/domain/entities/Profile';
 import { AppError } from '@/domain/errors';
-import type { ProfileRepository, ProfileUpdate } from '@/domain/repositories/ProfileRepository';
+import type { ProfileRepository } from '@/domain/repositories/ProfileRepository';
 
 import { PROFILE_COLUMNS, toProfile, type ProfileRow } from '../mappers/profileMapper';
 import { currentUserId, supabase } from '../remote/supabaseClient';
@@ -55,15 +55,6 @@ export class SupabaseProfileRepository implements ProfileRepository {
     const { data, error, status } = await supabase.rpc('get_profile_stats', { p_user: id }).single<ProfileStats>();
     fail(error, status);
     return data ?? { posts: 0, followers: 0, following: 0 };
-  }
-
-  async update(id: string, changes: ProfileUpdate): Promise<void> {
-    const row: Record<string, unknown> = {};
-    if (changes.fullName !== undefined) row.full_name = changes.fullName;
-    if (changes.bio !== undefined) row.bio = changes.bio;
-    if (changes.isPrivate !== undefined) row.is_private = changes.isPrivate;
-    const { error, status } = await supabase.from('profiles').update(row).eq('id', id);
-    fail(error, status);
   }
 
   async uploadAvatar(id: string, localUri: string): Promise<string> {
@@ -149,23 +140,6 @@ export class SupabaseProfileRepository implements ProfileRepository {
       .returns<{ follower: ProfileRow }[]>();
     fail(error, status);
     return (data ?? []).map((r) => toProfile(r.follower));
-  }
-
-  async acceptRequest(followerId: string): Promise<void> {
-    const me = await currentUserId();
-    // La política follows_update solo permite esto si YO soy la cuenta seguida.
-    const { error, status } = await supabase
-      .from('follows')
-      .update({ status: 'accepted' })
-      .eq('follower_id', followerId)
-      .eq('following_id', me);
-    fail(error, status);
-  }
-
-  async rejectRequest(followerId: string): Promise<void> {
-    const me = await currentUserId();
-    const { error, status } = await supabase.from('follows').delete().eq('follower_id', followerId).eq('following_id', me);
-    fail(error, status);
   }
 
   subscribeToRequests(myId: string, onChange: () => void): () => void {

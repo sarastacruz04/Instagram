@@ -92,6 +92,31 @@ export const operationHandlers: Handlers = {
     } catch {}
   },
 
+  async RESPOND_FOLLOW_REQUEST({ followerId, accept }, userId) {
+    // RLS (follows_update / follows_delete): solo el dueño de la cuenta seguida puede hacerlo.
+    // Si la persona canceló su solicitud mientras yo estaba sin red, el UPDATE/DELETE afecta
+    // 0 filas: no es error, el estado final es coherente (no queda solicitud).
+    if (accept) {
+      ensureOk(
+        await supabase
+          .from('follows')
+          .update({ status: 'accepted' })
+          .eq('follower_id', followerId)
+          .eq('following_id', userId),
+      );
+    } else {
+      ensureOk(await supabase.from('follows').delete().eq('follower_id', followerId).eq('following_id', userId));
+    }
+  },
+
+  async UPDATE_PROFILE({ fullName, bio, isPrivate }, userId) {
+    // Escribir el estado completo es idempotente: repetirlo deja el perfil igual.
+    // Si is_private pasa a false, el trigger accept_pending_on_public acepta las solicitudes pendientes.
+    ensureOk(
+      await supabase.from('profiles').update({ full_name: fullName, bio, is_private: isPrivate }).eq('id', userId),
+    );
+  },
+
   async SEND_MESSAGE({ id, conversationId, body }, userId) {
     // RLS (messages_insert) exige que yo sea el remitente Y miembro de la conversación.
     ensureOk(

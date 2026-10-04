@@ -103,7 +103,7 @@ Si no recuerdas un detalle, **razona en voz alta con estos 6 pasos**: el profe c
 | Vida de una historia | 24 h (`expires_at` del servidor) |
 | URL firmada | 1 h (se re-firma con 5 min de margen) |
 | Frame a 60 FPS | 16.6 ms |
-| Rendimiento medido | UI 59 fps · JS 57 fps (scroll de 200 posts) |
+| Rendimiento medido | Feed: UI 59 · JS 59 fps (caché vacía y caliente); grilla: UI 59 · JS 57 fps |
 
 ## Glosario exprés
 
@@ -1406,7 +1406,15 @@ A 60 FPS cada frame tiene **16.6 ms**. Durante el scroll, el UI thread mueve la 
 
 **Cómo medirlo:** en Expo Go, sacude el celular → **"Toggle Performance Monitor"**. Muestra FPS de **UI** y de **JS** por separado. Durante el scroll los dos deben mantenerse cerca de 60. Si baja el de JS, hay demasiado trabajo en React. Si baja el de UI, hay trabajo pesado en el hilo principal (p. ej. decodificación síncrona).
 
-**Resultado medido (Android, scroll continuo por la grilla de Explorar con 200 posts): UI 59 fps · JS 57 fps.**
+**Resultados medidos (Android, Expo Go en modo desarrollo):**
+
+| Escenario | UI | JS | RAM del proceso |
+|---|---|---|---|
+| Grilla de Explorar, 200 posts, scroll continuo | 59 fps | 57 fps | ~506 MB |
+| **Feed principal, caché VACÍA** (disco y RAM vaciados antes; imágenes descargándose y decodificándose durante el scroll) | **59 fps** | **59 fps** | 378 MB |
+| **Feed principal, caché CALIENTE** (segunda pasada) | **59 fps** | **59 fps** | 393 MB (estable) |
+
+Lectura: ni en el peor caso baja el hilo JS, porque descargar, escribir en disco, consultar SQLite y decodificar ocurren en **hilos nativos**; JS solo coordina. La memoria se **estabiliza** entre pasadas en vez de crecer → sin fugas. En una build de producción (JS optimizado, sin validaciones de desarrollo) el margen es aún mayor.
 
 **¿Y los "RAM 506 MB" del monitor?** Es la memoria **de todo el proceso**, no la de nuestro caché: incluye Expo Go completo (su propia UI y todos los módulos nativos que trae para cualquier proyecto), Hermes con el bundle de desarrollo sin optimizar, las herramientas de depuración y la conexión con Metro. En una build de producción la cifra es mucho menor. Lo que controla nuestro código se ve en el panel de caché (L1 ≤ 64 MB). Para evaluar fugas lo que importa es la **tendencia**: si al hacer scroll largo y volver la cifra crece sin parar, hay una fuga; si sube y se estabiliza, el presupuesto está funcionando.
 
@@ -1920,6 +1928,35 @@ Al compartir `exp://anonymous-8081.exp.direct/--/post/<id>` por WhatsApp y tocar
 **P71. Si compartes el link por WhatsApp, ¿por qué no abre la app?**
 Porque WhatsApp solo hace clickeables los links http(s): `exp://` o `instagramclone://` no son clickeables, y WhatsApp convirtió la parte del dominio en una URL web. En producción se usan App Links / Universal Links: un link `https` de un dominio verificado (`assetlinks.json`) que el SO abre en la app si está instalada o en la web si no. El código de ruteo (`+native-intent` y las rutas) sería el mismo; solo cambia cómo llega el link.
 
+## 8.2c Más escrituras por la cola: responder solicitudes y editar perfil
+
+El PDF dice: *"Las peticiones de red deben encapsularse en una cola de sincronización local"*. Se agregaron dos operaciones a `SyncOperation` (con sus ejecutores en `operationHandlers.ts`):
+
+| Operación | Payload | Coalescencia | Idempotencia |
+|---|---|---|---|
+| `RESPOND_FOLLOW_REQUEST` | `{ followerId, accept }` | `follow-request:<followerId>` → la **última decisión** sobre esa persona gana | Aceptar dos veces deja la fila igual; rechazar algo que ya no existe borra 0 filas. Si la persona canceló su solicitud mientras yo estaba sin red, el resultado sigue siendo coherente. |
+| `UPDATE_PROFILE` | `{ fullName, bio, isPrivate }` (**estado completo**) | `profile` → 3 ediciones sin red = 1 petición | Escribir el estado completo es idempotente. Por ser **estado completo** (no un parche parcial) se puede fusionar sin perder campos. |
+
+- **UI optimista:** en Actividad la solicitud desaparece al instante; en Editar perfil, el perfil cambia en memoria (`updateMyProfile` en `sessionStore`) y se vuelve atrás sin esperar la red.
+- **Reconciliación** (`domain/sync/reconcile.ts`, funciones puras):
+  - `hideRespondedRequests`: al recargar Actividad, las solicitudes ya respondidas que siguen en la cola no reaparecen (el servidor aún las tiene como `pending`).
+  - `applyPendingProfile`: al recargar mi perfil, se aplica encima la edición que sigue en la cola.
+- **Rollback:** `onPermanentFailure` → alerta + recargar el estado real del servidor.
+- Se quitaron `update`, `acceptRequest` y `rejectRequest` del `ProfileRepository`: no debe haber **dos caminos** para la misma escritura.
+
+### Qué escrituras van por la cola y cuáles no (criterio)
+
+| Va por la cola | No va por la cola | Por qué |
+|---|---|---|
+| Like, comentario, post, historia, mensaje, responder solicitud, editar perfil | — | El cliente puede **predecir el resultado** → UI optimista segura + funciona sin red. |
+| — | **Seguir / dejar de seguir** | El resultado (`pending` o `accepted`) lo **decide el servidor** según la privacidad real; no se puede predecir. |
+| — | **Cambiar foto de perfil** | Es una subida cuyo resultado (la URL pública nueva) lo da el servidor. Se podría encolar como los posts, pero no lo pide el enunciado. |
+| — | Confirmaciones de entrega/lectura (`mark_read`…) | Son **señales efímeras** (si se pierden, se recalculan al reconectar con `mark_all_delivered`); encolarlas no aporta. |
+| — | **Lecturas** (feed, perfil, mensajes) | Una lectura sin red no tiene sentido diferirla: se sirve la **caché local** (feed) o se reintenta al reconectar. |
+
+**P72. El enunciado dice que las peticiones de red deben ir en una cola. ¿Todas van por la cola?**
+Todas las **escrituras cuyo resultado puede predecir el cliente**: like, comentario, post, historia, mensaje, responder solicitud y editar perfil. Así son optimistas y funcionan sin red. No van: seguir (el servidor decide `pending`/`accepted`), la foto de perfil (el servidor devuelve la URL), las confirmaciones de lectura (señales que se recalculan) y las lecturas (se sirven de caché o se reintentan). Es un criterio, no un olvido: encolar algo cuyo resultado decide el servidor obligaría a mostrar un estado que podría ser falso.
+
 ## 8.3 Limpieza
 
 - Eliminado `Placeholder.tsx` (sin uso desde la Fase 4).
@@ -1957,6 +1994,7 @@ Porque WhatsApp solo hace clickeables los links http(s): `exp://` o `instagramcl
 
 **Antes de entrar:**
 - [ ] Metro corriendo (`bash scripts/start-phone.sh`) y la app abierta en los **dos** celulares con cuentas distintas.
+- [ ] **Recargar la app CON internet** (sacudir → Reload, y ver `Android Bundled` en Metro) **antes** de cualquier demo en modo avión. En Expo Go el código JS se descarga de Metro: si se activa el modo avión antes de recargar, queda corriendo la versión anterior. (En una build de producción el código va dentro de la app y esto no pasa.)
 - [ ] Celulares cargados y con datos/Wi-Fi.
 - [ ] VS Code abierto en el proyecto con `docs/DEFENSA.md` y `src/` a mano.
 
@@ -1983,6 +2021,7 @@ Porque WhatsApp solo hace clickeables los links http(s): `exp://` o `instagramcl
 | Perfil ajeno en blanco | `ProfileView` cargaba perfil + contadores + seguimiento con `Promise.all` dentro de un `try { } catch {}` vacío: si fallaba **una** consulta (p. ej. `get_profile_stats` sin el SQL de la Fase 4) se perdían las tres y el error se tragaba en silencio | `Promise.allSettled`: cada carga es independiente; el perfil se muestra aunque fallen los contadores. Estados explícitos: cargando / no existe / error con "Reintentar". **Lección:** nunca un `catch {}` vacío en una carga de pantalla. |
 | Registro que "no hacía nada" / login "incorrecto" | Con "Confirm email" activo, `signUp` crea el usuario **sin sesión** y la app no lo avisaba | `signUp` verifica `data.session` y explica qué pasó; mensajes específicos para "Email not confirmed", signups desactivados y username duplicado. Correo en minúsculas al registrar y al entrar. |
 | Presentación importaba tipos de la capa `data` (violación de Clean Architecture) | `CachedImage`, el panel de caché y el visor usaban `ImageHandle`/`ImageCacheStats` definidos en `ImageCacheEngine` | Puerto `core/cache/ImageCache.ts`; el motor lo implementa y el contenedor lo exporta tipado como interfaz |
+| Al probar "editar perfil" en modo avión salió "Sin conexión" y no se encoló | La app seguía con el bundle JS **anterior**: en Expo Go el código nuevo llega desde Metro por la red, y el modo avión se activó antes de recargar | Recargar con internet (ver `Android Bundled` en Metro) y luego activar el modo avión. No era un error del código |
 | Deep link perdido si no había sesión | `Stack.Protected` redirige al login y descarta el destino | `pendingDeepLink.ts` + consumo en la transición `signedOut → signedIn` |
 | "Vaciar RAM" no liberaba casi nada | Las pestañas no se desmontan: el feed y Explorar, en segundo plano, seguían **fijando** sus bitmaps y la LRU no desaloja lo fijado | `useIsFocused` en `CachedImage`: sin foco se suelta el bitmap y se olvida la referencia; al volver se pide de nuevo (RAM/disco). La alerta del botón ahora dice cuántos se liberaron y cuántos siguen en pantalla. |
 | Carrera: bitmap desalojado entre la inserción en la LRU y el `pin` de las celdas | Ventana entre la resolución de la Promise y la ejecución de los `.then` | Reserva `users = 1` al insertar, liberada con `setTimeout(0)` (después de todas las microtareas) |
@@ -2004,7 +2043,7 @@ Porque WhatsApp solo hace clickeables los links http(s): `exp://` o `instagramcl
 | Fase 4: SQL `002_fase4.sql` ejecutado en Supabase | ✅ |
 | Fase 4: prueba en dispositivo con 2 cuentas | ✅ |
 | Fase 5: typecheck, lint, bundle Android | ✅ |
-| Fase 5: Performance Monitor en scroll de 200 posts | ✅ UI 59 fps · JS 57 fps (Android) |
+| Fase 5: Performance Monitor en scroll de 200 posts | ✅ Grilla: UI 59 · JS 57 fps · Feed (caché vacía y caliente): UI 59 · JS 59 fps |
 | Fase 5: "Vaciar disco" | ✅ |
 | Fase 5: "Vaciar RAM" tras la corrección de `useIsFocused` | ✅ |
 | Fase 6: typecheck, lint, bundle Android | ✅ |
@@ -2014,5 +2053,7 @@ Porque WhatsApp solo hace clickeables los links http(s): `exp://` o `instagramcl
 | Fase 7: SQL `004_fase7.sql` ejecutado | ✅ |
 | Fase 7: prueba en dispositivo | ✅ |
 | Fase 8: `expo-doctor` 21/21, `tsc`, `lint`, bundle Android | ✅ |
-| Fase 8: deep link compartido → abrir con sesión (pila de Home) | ⏳ pendiente |
-| Fase 8: deep link → abrir **sin** sesión → iniciar sesión → abre el post | ⏳ pendiente |
+| Fase 8: deep link lanzado como intent del SO (botón de prueba) → abre el post en la pila de Home | ✅ probado en Android |
+| Fase 8: deep link → abrir **sin** sesión → iniciar sesión → abre el post | ⏳ pendiente (requiere `adb`) |
+| Fase 8: editar perfil por la cola (modo avión → bio visible al instante → "1 pendiente" → sincroniza al volver la red) | ✅ probado en Android |
+| Fase 8: responder solicitud por la cola (modo avión) | ⏳ pendiente |

@@ -30,6 +30,18 @@ export type SyncOperation =
       type: 'SEND_MESSAGE';
       // Mismo principio: id del cliente → el reintento no duplica el mensaje.
       payload: { id: string; conversationId: string; body: string };
+    }
+  | {
+      type: 'RESPOND_FOLLOW_REQUEST';
+      // Decisión del dueño de la cuenta privada. Idempotente: aceptar dos veces deja la fila
+      // igual; rechazar algo que ya no existe borra 0 filas.
+      payload: { followerId: string; accept: boolean };
+    }
+  | {
+      type: 'UPDATE_PROFILE';
+      // ESTADO COMPLETO deseado (no un parche parcial): por eso se puede fusionar con
+      // coalescencia sin perder campos; solo importa la última edición.
+      payload: { fullName: string; bio: string; isPrivate: boolean };
     };
 
 export type SyncOperationType = SyncOperation['type'];
@@ -50,6 +62,10 @@ export function coalesceKeyOf(op: SyncOperation): string | null {
   switch (op.type) {
     case 'SET_LIKE':
       return `like:${op.payload.postId}`;
+    case 'RESPOND_FOLLOW_REQUEST':
+      return `follow-request:${op.payload.followerId}`; // la última decisión sobre esa persona gana
+    case 'UPDATE_PROFILE':
+      return 'profile'; // 3 ediciones sin red = 1 sola petición con el estado final
     default:
       return null;
   }

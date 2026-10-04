@@ -10,7 +10,7 @@ import { ImageCacheDiagnostics } from '@/presentation/components/ImageCacheDiagn
 import { PrimaryButton } from '@/presentation/components/PrimaryButton';
 import { SyncDiagnostics } from '@/presentation/components/SyncDiagnostics';
 import { TextField } from '@/presentation/components/TextField';
-import { refreshMyProfile, useSession } from '@/presentation/stores/sessionStore';
+import { refreshMyProfile, updateMyProfile, useSession } from '@/presentation/stores/sessionStore';
 import { colors, spacing, typography } from '@/presentation/theme';
 
 export default function EditProfileScreen() {
@@ -38,11 +38,12 @@ export default function EditProfileScreen() {
     }
   };
 
+  // Optimista + cola offline: no espera a la red. El perfil cambia ya y se sincroniza después.
+  // (La foto NO va por la cola: es una subida cuyo resultado —la URL nueva— lo da el servidor.)
   const save = async () => {
     setSaving(true);
     try {
-      await profileRepository.update(profile.id, { fullName: fullName.trim(), bio: bio.trim(), isPrivate });
-      await refreshMyProfile();
+      await updateMyProfile({ fullName: fullName.trim(), bio: bio.trim(), isPrivate });
       router.back();
     } catch (e) {
       Alert.alert('No se pudo guardar', (e as Error).message);
